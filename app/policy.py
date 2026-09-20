@@ -7,10 +7,11 @@ aligned with a prefix.  Pieces are merged back only when they form two
 complete, adjacent sibling prefixes (via :func:`ipaddress.collapse_addresses`),
 which yields the equivalent, non-overlapping and minimum-cardinality CIDR set.
 
-The module also hosts two scope-based consumers of the same primitives:
-``compare`` (decision diff of two policy sets inside one scope) and
+The module also hosts scope-based consumers of the same primitives:
+``compare`` (decision diff of two policy sets inside one scope),
 ``allocate`` (lexicographically smallest non-overlapping subnet assignment
-inside one scope, avoiding occupied CIDRs).
+inside one scope, avoiding occupied CIDRs) and ``audit_rules`` (per-rule
+effective/shadowed/out_of_scope classification inside one scope).
 """
 
 from __future__ import annotations
@@ -482,6 +483,191 @@ def compare(
             key: str(counts[key]) for key in TRANSITION_KEYS
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# audit-rules: per-rule effectiveness inside one scope.  The scope is
+# partitioned exactly as in ``compare`` (recursive CIDR splits only, never
+# address enumeration), but every tile keeps the *identity*
+# ``(side, original index)`` of the entry that wins it.  A rule is then
+# effective on the tiles it wins, shadowed when none of the tiles inside its
+# own prefix are won by it, and out_of_scope when its prefix misses the scope.
+# ---------------------------------------------------------------------------
+
+
+def _winner_partition_node(
+    network: Network,
+    inherited: tuple[str, int, Network] | None,
+    entries: Sequence[tuple[str, int, Network]],
+    out: list[tuple[Network, tuple[str, int, Network] | None]],
+) -> None:
+    """Recursively append ``(piece, winning entry)`` tiles covering ``network``.
+
+    Identical traversal to :func:`_partition_node`; the only difference is
+    that the winning entry itself is carried instead of its side, so callers
+    can tell *which* rule decides a tile (needed for duplicate handling).
+    ``inherited`` is the winner at a strictly broader prefix; ``entries`` are
+    the entries equal to or stricter than ``network``.
+    """
+    own = [entry for entry in entries if entry[2] == network]
+    strict = [entry for entry in entries if entry[2] != network]
+    # An equal-length entry always beats the inherited strictly-broader
+    # winner (longest-prefix rule); deny still wins equal-length own ties and
+    # the earlier per-side index wins duplicates.
+    winner: tuple[str, int, Network] | None = max(
+        own, key=lambda e: (e[2].prefixlen, _SIDE_RANK[e[0]], -e[1]),
+        default=inherited,
+    )
+
+    if not strict or network.prefixlen == _MAX_PREFIXLEN[type(network)]:
+        out.append((network, winner))
+        return
+
+    left, right = network.subnets()
+    for half in (left, right):
+        half_entries = [entry for entry in strict if entry[2].subnet_of(half)]
+        _winner_partition_node(half, winner, half_entries, out)
+
+
+def _winner_partition(
+    scope: Network,
+    entries: Sequence[tuple[str, int, Network]],
+) -> list[tuple[Network, tuple[str, int, Network] | None]]:
+    """Partition ``scope`` into tiles, each tagged with its winning entry.
+
+    Same semantics as :func:`_decision_partition`; a tile whose winner is
+    ``None`` is matched by no entry (``unmatched``).  Tiles are prefix
+    aligned, so any entry prefix either wholly contains or is disjoint from
+    each tile — an entry can never win only part of a tile.
+    """
+    covering = [
+        entry for entry in entries
+        if entry[2] == scope or scope.subnet_of(entry[2])
+    ]
+    root_winner = max(
+        covering,
+        key=lambda e: (e[2].prefixlen, _SIDE_RANK[e[0]], -e[1]),
+        default=None,
+    )
+    strict = [
+        entry for entry in entries
+        if entry[2] != scope and entry[2].subnet_of(scope)
+    ]
+
+    pieces: list[tuple[Network, tuple[str, int, Network] | None]] = []
+    if not strict:
+        pieces.append((scope, root_winner))
+        return pieces
+
+    left, right = scope.subnets()
+    for half in (left, right):
+        half_entries = [entry for entry in strict if entry[2].subnet_of(half)]
+        _winner_partition_node(half, root_winner, half_entries, pieces)
+    return pieces
+
+
+def audit_rules(
+    scope_raw: str,
+    allow_raw: Sequence[str],
+    deny_raw: Sequence[str],
+) -> dict:
+    """Classify every allow/deny rule by its real effect on scope decisions.
+
+    For each input rule (reported side-first — all allow entries in original
+    order, then all deny entries) the status is:
+
+    * ``effective``: the rule is the longest-prefix winner on at least one
+      address inside the scope; ``witness`` is the smallest network address
+      of the region it wins (always the network address of one partition
+      tile, found without enumerating addresses);
+    * ``shadowed``: the rule overlaps the scope yet never wins inside it;
+      ``shadowed_by`` lists every other rule that actually wins some part of
+      the rule's prefix inside the scope (identities ``{side, index}``,
+      allow-side first then ascending index);
+    * ``out_of_scope``: the rule does not overlap the scope at all.
+
+    Duplicate rules follow the stable priority already used by
+    :func:`evaluate`: equal length, same side -> the earlier index wins, so
+    later duplicates are shadowed by the earlier one.
+
+    Entries of the other address family are rejected (the caller maps the
+    resulting :class:`ValueError` to HTTP 422); like :func:`compare`, this
+    analysis is based solely on recursive CIDR partitioning and never
+    enumerates addresses.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+
+    rules: list[tuple[str, int, Network]] = []
+    for index, item in enumerate(allow_raw):
+        network = parse_network(item)
+        if not isinstance(network, family):
+            raise ValueError(
+                f"allow CIDR {network} does not match the scope address "
+                f"family ({scope})"
+            )
+        rules.append(("allow", index, network))
+    for index, item in enumerate(deny_raw):
+        network = parse_network(item)
+        if not isinstance(network, family):
+            raise ValueError(
+                f"deny CIDR {network} does not match the scope address "
+                f"family ({scope})"
+            )
+        rules.append(("deny", index, network))
+
+    pieces = _winner_partition(scope, rules)
+
+    results: list[dict] = []
+    # ``rules`` was appended allow-first then deny, so iterating it directly
+    # yields side-first, per-side original-input order.
+    for side, index, network in rules:
+        result = {"side": side, "index": index, "cidr": str(network)}
+
+        if not network.overlaps(scope):
+            # A same-family prefix that shares no address with the scope.
+            result.update(status="out_of_scope", witness=None, shadowed_by=[])
+            results.append(result)
+            continue
+
+        # Prefix alignment guarantees a tile meeting the rule's prefix is
+        # wholly contained in it, so identity comparison is exact.
+        inside = [
+            (tile, winner)
+            for tile, winner in pieces
+            if tile.subnet_of(network)
+        ]
+        won = [
+            tile for tile, winner in inside
+            if winner is not None and winner[0] == side and winner[1] == index
+        ]
+        if won:
+            witness_network = min(won, key=_sort_key)
+            result.update(
+                status="effective",
+                witness=str(witness_network.network_address),
+                shadowed_by=[],
+            )
+        else:
+            blockers = {
+                (winner[0], winner[1])
+                for _tile, winner in inside
+                if winner is not None
+            }
+            result.update(
+                status="shadowed",
+                witness=None,
+                shadowed_by=[
+                    {"side": blocker_side, "index": blocker_index}
+                    for blocker_side, blocker_index in sorted(
+                        blockers,
+                        key=lambda ref: (_SIDE_RANK[ref[0]], ref[1]),
+                    )
+                ],
+            )
+        results.append(result)
+
+    return {"results": results}
 
 
 # ---------------------------------------------------------------------------

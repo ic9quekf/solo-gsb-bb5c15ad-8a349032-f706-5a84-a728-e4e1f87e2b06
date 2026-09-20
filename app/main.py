@@ -1,14 +1,18 @@
-"""FastAPI application exposing POST /normalize, /evaluate, /compare and /allocate."""
+"""FastAPI application exposing POST /normalize, /evaluate, /compare,
+/allocate and /audit-rules."""
 
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
-from app.policy import allocate, compare, evaluate, normalize
+from app.policy import allocate, audit_rules, compare, evaluate, normalize
 from app.schemas import (
     AddressDecision,
     AllocateRequest,
     AllocateResponse,
+    AuditRulesRequest,
+    AuditRulesResponse,
     CompareRequest,
     CompareResponse,
     EvaluateRequest,
@@ -23,10 +27,12 @@ app = FastAPI(
         "equivalent, non-overlapping, minimum-count CIDR set; evaluate "
         "individual addresses against the same lists via longest-prefix "
         "match; diff two policy sets (baseline vs candidate) over a "
-        "scope CIDR; and allocate non-overlapping subnets for a list of "
-        "requests inside one scope, avoiding already-occupied CIDRs."
+        "scope CIDR; allocate non-overlapping subnets for a list of "
+        "requests inside one scope, avoiding already-occupied CIDRs; and "
+        "audit each rule of one policy set for its real effect inside a "
+        "scope (effective, shadowed or out_of_scope)."
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -305,3 +311,145 @@ def allocate_subnets(request: AllocateRequest) -> dict:
             ),
         )
     return result
+
+
+def _verdict_payload(item) -> dict:
+    """Trim an AuditRuleResult down to the fields applicable to its status."""
+    payload = {
+        "side": item.side,
+        "index": item.index,
+        "cidr": item.cidr,
+        "status": item.status,
+    }
+    if item.status == "effective":
+        payload["witness"] = item.witness
+    elif item.status == "shadowed":
+        payload["shadowed_by"] = [
+            {"side": ref.side, "index": ref.index}
+            for ref in item.shadowed_by
+        ]
+    return payload
+
+
+@app.post(
+    "/audit-rules",
+    response_model=AuditRulesResponse,
+    tags=["policy"],
+    summary="Audit each allow/deny rule's real effect inside a scope",
+    openapi_extra={
+        # Returning a JSONResponse directly bypasses response-model
+        # re-serialization (which would re-add the witness/shadowed_by
+        # defaults); the model still registers the component schemas above.
+        # Named body/response examples also survive verbatim here.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "effective_shadowed_out_of_scope_and_duplicate": {
+                            "summary": (
+                                "The broad /24 allow keeps winning the "
+                                "uncovered 10.0.0.80-255 region; its "
+                                "duplicate is shadowed by the earlier copy "
+                                "plus the /28 allow and /26 deny; one deny "
+                                "is outside the scope"
+                            ),
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "allow": [
+                                    "10.0.0.0/24",
+                                    "10.0.0.0/24",
+                                    "10.0.0.64/28",
+                                ],
+                                "deny": [
+                                    "10.0.0.0/26",
+                                    "10.0.1.0/24",
+                                ],
+                            },
+                        },
+                        "family_mismatch": {
+                            "summary": "IPv6 rule against an IPv4 scope -> HTTP 422",
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "allow": ["2001:db8::/32"],
+                                "deny": [],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "responses": {
+            "200": {
+                "description": (
+                    "One verdict per input rule, side-first (allow then "
+                    "deny), each in original input order."
+                ),
+                "content": {
+                    "application/json": {
+                        "examples": {
+                            "effective_shadowed_out_of_scope_and_duplicate": {
+                                "summary": (
+                                    "effective / shadowed / out_of_scope"
+                                ),
+                                "value": {
+                                    "results": [
+                                        {
+                                            "side": "allow", "index": 0,
+                                            "cidr": "10.0.0.0/24",
+                                            "status": "effective",
+                                            "witness": "10.0.0.80",
+                                        },
+                                        {
+                                            "side": "allow", "index": 1,
+                                            "cidr": "10.0.0.0/24",
+                                            "status": "shadowed",
+                                            "shadowed_by": [
+                                                {"side": "allow", "index": 0},
+                                                {"side": "allow", "index": 2},
+                                                {"side": "deny", "index": 0},
+                                            ],
+                                        },
+                                        {
+                                            "side": "allow", "index": 2,
+                                            "cidr": "10.0.0.64/28",
+                                            "status": "effective",
+                                            "witness": "10.0.0.64",
+                                        },
+                                        {
+                                            "side": "deny", "index": 0,
+                                            "cidr": "10.0.0.0/26",
+                                            "status": "effective",
+                                            "witness": "10.0.0.0",
+                                        },
+                                        {
+                                            "side": "deny", "index": 1,
+                                            "cidr": "10.0.1.0/24",
+                                            "status": "out_of_scope",
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            "422": {
+                "description": (
+                    "Invalid scope or rule CIDR, or a rule whose address "
+                    "family differs from the scope's."
+                ),
+            },
+        },
+    },
+)
+def audit_policy_rules(request: AuditRulesRequest) -> JSONResponse:
+    result = audit_rules(request.scope, request.allow, request.deny)
+    # Validate against the response model, then trim per-status fields:
+    # witness is emitted only for effective rules and shadowed_by only for
+    # shadowed ones (out_of_scope carries neither). Returning the
+    # JSONResponse directly keeps response_model from re-expanding defaults.
+    validated = AuditRulesResponse.model_validate(result)
+    payload = {
+        "results": [_verdict_payload(item) for item in validated.results]
+    }
+    return JSONResponse(payload)

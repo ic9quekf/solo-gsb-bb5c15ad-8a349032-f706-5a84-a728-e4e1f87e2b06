@@ -10,6 +10,7 @@ import pytest
 from app.policy import (
     _normalize_family,
     allocate,
+    audit_rules,
     compare,
     evaluate,
     normalize,
@@ -826,3 +827,364 @@ def test_allocate_matches_brute_force_ipv6(seed):
         for i in range(rng.randint(0, 3))
     ]
     _assert_allocate_matches_brute_force(scope, occupied, requests)
+
+
+# --------------------------------------------------------------------------
+# audit-rules: per-rule effectiveness inside one scope
+# --------------------------------------------------------------------------
+
+
+def _audit_index(data, side, index):
+    """Fetch the verdict of rule (side, index) from an audit_rules result."""
+    return next(
+        item for item in data["results"]
+        if item["side"] == side and item["index"] == index
+    )
+
+
+def test_audit_basic_effective_shadowed_out_of_scope():
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/24", "10.0.0.0/25"],
+        ["10.0.0.0/26"],
+    )
+    # The broad /24 allow only keeps 10.0.0.128-255 (the /25 allow covers
+    # 64-127 and the deny takes 0-63), so its smallest witness is .128.
+    broad = _audit_index(result, "allow", 0)
+    assert broad["status"] == "effective"
+    assert broad["witness"] == "10.0.0.128"
+    assert broad["shadowed_by"] == []
+    # The /25 allow wins the middle region 10.0.0.64-127 (smallest 64/26).
+    half = _audit_index(result, "allow", 1)
+    assert half["status"] == "effective"
+    assert half["witness"] == "10.0.0.64"
+    # The deny /26 wins the lowest quarter outright.
+    blocked = _audit_index(result, "deny", 0)
+    assert blocked["status"] == "effective"
+    assert blocked["witness"] == "10.0.0.0"
+
+
+def test_audit_results_are_side_first_in_input_order():
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/25", "10.0.0.0/26"],
+        ["10.0.0.128/25"],
+    )
+    assert [(item["side"], item["index"]) for item in result["results"]] == [
+        ("allow", 0), ("allow", 1), ("deny", 0),
+    ]
+    # Canonical CIDR strings are echoed back.
+    assert _audit_index(result, "deny", 0)["cidr"] == "10.0.0.128/25"
+
+
+def test_audit_rule_fully_covered_by_longer_prefixes_is_shadowed():
+    # The allow /24 leaves no winning address: the /26 deny takes the low
+    # quarter and the /26 allow halves cover the rest via the /25s.
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/24", "10.0.0.0/25", "10.0.0.128/25"],
+        ["10.0.0.0/26"],
+    )
+    broad = _audit_index(result, "allow", 0)
+    assert broad["status"] == "shadowed"
+    assert broad["witness"] is None
+    # Actual winners over the broad prefix, side-first, ascending index:
+    # allow /25 (1), allow /25 (2), deny /26 (0).
+    assert broad["shadowed_by"] == [
+        {"side": "allow", "index": 1},
+        {"side": "allow", "index": 2},
+        {"side": "deny", "index": 0},
+    ]
+
+
+def test_audit_equal_length_deny_shadows_allow():
+    result = audit_rules(
+        "10.0.0.0/24", ["10.0.0.0/25"], ["10.0.0.0/25"]
+    )
+    allow = _audit_index(result, "allow", 0)
+    assert allow["status"] == "shadowed"
+    assert allow["shadowed_by"] == [{"side": "deny", "index": 0}]
+    deny = _audit_index(result, "deny", 0)
+    assert deny["status"] == "effective"
+    assert deny["witness"] == "10.0.0.0"
+
+
+def test_audit_duplicate_rules_stable_priority_earlier_wins():
+    # Two identical allows: the earlier copy wins, the later is shadowed by
+    # exactly that copy.
+    result = audit_rules(
+        "10.0.0.0/24", ["10.0.0.0/24", "10.0.0.0/24"], []
+    )
+    first = _audit_index(result, "allow", 0)
+    second = _audit_index(result, "allow", 1)
+    assert first["status"] == "effective"
+    assert first["witness"] == "10.0.0.0"
+    assert second["status"] == "shadowed"
+    assert second["shadowed_by"] == [{"side": "allow", "index": 0}]
+
+    # Three copies: the winner stays the first; both later copies see only
+    # the first copy as the actual winner.
+    result = audit_rules(
+        "10.0.0.0/24", ["10.0.0.0/24"] * 3, []
+    )
+    for index in (1, 2):
+        dup = _audit_index(result, "allow", index)
+        assert dup["status"] == "shadowed"
+        assert dup["shadowed_by"] == [{"side": "allow", "index": 0}]
+
+
+def test_audit_duplicate_allows_with_deny_share_one_blocker_set():
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/24", "10.0.0.0/24", "10.0.0.64/28"],
+        ["10.0.0.0/26"],
+    )
+    first = _audit_index(result, "allow", 0)
+    second = _audit_index(result, "allow", 1)
+    assert first["status"] == "effective"
+    assert first["witness"] == "10.0.0.80"
+    assert second["status"] == "shadowed"
+    # The duplicate never wins: wherever the broad prefix decides, the first
+    # copy wins (0-63 deny, 64-79 allow /28, 80-255 first /24 copy).
+    assert second["shadowed_by"] == [
+        {"side": "allow", "index": 0},
+        {"side": "allow", "index": 2},
+        {"side": "deny", "index": 0},
+    ]
+
+
+def test_audit_disjoint_same_family_rule_is_out_of_scope():
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/24", "192.168.0.0/24"],
+        ["10.1.0.0/16"],
+    )
+    assert _audit_index(result, "allow", 0)["status"] == "effective"
+    stray_allow = _audit_index(result, "allow", 1)
+    assert stray_allow["status"] == "out_of_scope"
+    assert stray_allow["witness"] is None
+    assert stray_allow["shadowed_by"] == []
+    stray_deny = _audit_index(result, "deny", 0)
+    assert stray_deny["status"] == "out_of_scope"
+
+
+def test_audit_supernet_rule_effective_with_scope_only_partly_covered():
+    # A deny broader than the scope decides the whole scope; the allow /24
+    # inside it can only win where it is longer (everywhere here) -> allow is
+    # effective, and an allow narrower than the scope still works.
+    result = audit_rules(
+        "10.0.0.0/25",
+        ["10.0.0.0/24"],
+        ["10.0.0.0/16"],
+    )
+    allow = _audit_index(result, "allow", 0)
+    assert allow["status"] == "effective"
+    assert allow["witness"] == "10.0.0.0"
+    deny = _audit_index(result, "deny", 0)
+    assert deny["status"] == "shadowed"
+    assert deny["shadowed_by"] == [{"side": "allow", "index": 0}]
+
+
+def test_audit_supernet_rule_wins_when_no_more_specific_entry():
+    result = audit_rules(
+        "10.0.0.0/25", [], ["10.0.0.0/16"]
+    )
+    deny = _audit_index(result, "deny", 0)
+    assert deny["status"] == "effective"
+    # Witness lies inside the scope even though the rule starts at 10.0.0.0.
+    assert deny["witness"] == "10.0.0.0"
+
+
+def test_audit_scope_itself_is_allowed_as_rule():
+    result = audit_rules(
+        "10.0.0.0/30", ["10.0.0.0/30"], ["10.0.0.2/31"]
+    )
+    allow = _audit_index(result, "allow", 0)
+    assert allow["status"] == "effective"
+    # Lowest tile the /30 allow keeps is 10.0.0.0/31.
+    assert allow["witness"] == "10.0.0.0"
+    deny = _audit_index(result, "deny", 0)
+    assert deny["status"] == "effective"
+    assert deny["witness"] == "10.0.0.2"
+
+
+def test_audit_empty_lists():
+    result = audit_rules("10.0.0.0/24", [], [])
+    assert result == {"results": []}
+
+
+def test_audit_ipv6_scope_and_witness():
+    result = audit_rules(
+        "2001:db8::/124",
+        ["2001:db8::/124", "2001:db8::4/126"],
+        ["2001:db8::/126"],
+    )
+    broad = _audit_index(result, "allow", 0)
+    assert broad["status"] == "effective"
+    # Tiles: 2001:db8::/126 deny, ::4/126 allow, ::8/125 broad allow...
+    # scope ends at ::f, so the broad prefix keeps ::8-::f (::8/125 tile).
+    assert broad["witness"] == "2001:db8::8"
+    mid = _audit_index(result, "allow", 1)
+    assert mid["status"] == "effective"
+    assert mid["witness"] == "2001:db8::4"
+    blocked = _audit_index(result, "deny", 0)
+    assert blocked["status"] == "effective"
+    assert blocked["witness"] == "2001:db8::"
+
+
+def test_audit_ipv6_disjoint_rule_is_out_of_scope():
+    result = audit_rules(
+        "2001:db8::/126", ["2001:db9::/126"], []
+    )
+    assert _audit_index(result, "allow", 0)["status"] == "out_of_scope"
+
+
+def test_audit_family_mismatch_raises():
+    with pytest.raises(ValueError):
+        audit_rules("10.0.0.0/24", ["2001:db8::/32"], [])
+    with pytest.raises(ValueError):
+        audit_rules("2001:db8::/32", [], ["10.0.0.0/8"])
+
+
+def test_audit_invalid_inputs_raise():
+    with pytest.raises(ValueError):
+        audit_rules("bogus", [], [])
+    with pytest.raises(ValueError):
+        audit_rules("10.0.0.1/24", [], [])
+    with pytest.raises(ValueError):
+        audit_rules("10.0.0.0/24", ["10.0.0.1/24"], [])
+    with pytest.raises(ValueError):
+        audit_rules("10.0.0.0/24", [], ["not-a-cidr"])
+
+
+def test_audit_bare_address_rule_is_host_prefix():
+    result = audit_rules(
+        "10.0.0.0/30", ["10.0.0.1"], []
+    )
+    host = _audit_index(result, "allow", 0)
+    assert host["cidr"] == "10.0.0.1/32"
+    assert host["status"] == "effective"
+    assert host["witness"] == "10.0.0.1"
+
+
+# A pointwise winner key mirrors app.policy._best_match but keeps the rule
+# identity, giving an enumeration-based oracle for the CIDR partition result.
+def _point_winner(allow_raw, deny_raw, address):
+    best = None
+    best_ref = None
+    for index, item in enumerate(allow_raw):
+        network = ipaddress.ip_network(item, strict=True)
+        if address.version != network.version or address not in network:
+            continue
+        key = (network.prefixlen, 0, -index)
+        if best is None or key > best:
+            best, best_ref = key, ("allow", index)
+    for index, item in enumerate(deny_raw):
+        network = ipaddress.ip_network(item, strict=True)
+        if address.version != network.version or address not in network:
+            continue
+        key = (network.prefixlen, 1, -index)
+        if best is None or key > best:
+            best, best_ref = key, ("deny", index)
+    return best_ref
+
+
+def _assert_audit_matches_pointwise(scope_raw, allow_raw, deny_raw):
+    scope_net = ipaddress.ip_network(scope_raw)
+    start = int(scope_net.network_address)
+    hosts = [
+        ipaddress.ip_address(start + offset)
+        for offset in range(scope_net.num_addresses)
+    ]
+    point_winners = [_point_winner(allow_raw, deny_raw, host) for host in hosts]
+
+    result = audit_rules(scope_raw, allow_raw, deny_raw)
+    # Side-first input order.
+    assert [(item["side"], item["index"]) for item in result["results"]] == [
+        *[("allow", i) for i in range(len(allow_raw))],
+        *[("deny", i) for i in range(len(deny_raw))],
+    ]
+
+    for item in result["results"]:
+        side, index = item["side"], item["index"]
+        network = ipaddress.ip_network(item["cidr"], strict=True)
+
+        if not network.overlaps(scope_net):
+            assert item["status"] == "out_of_scope"
+            assert item["witness"] is None
+            assert item["shadowed_by"] == []
+            continue
+
+        won_offsets = [
+            offset for offset, host in enumerate(hosts)
+            if host in network and point_winners[offset] == (side, index)
+        ]
+        if won_offsets:
+            assert item["status"] == "effective"
+            # Witness is the numerically smallest winning address.
+            assert item["witness"] == str(hosts[min(won_offsets)])
+            assert item["shadowed_by"] == []
+            # And that address really is decided by this rule.
+            assert point_winners[min(won_offsets)] == (side, index)
+        else:
+            assert item["status"] == "shadowed"
+            assert item["witness"] is None
+            # shadowed_by is exactly the set of distinct actual winners
+            # inside the rule's prefix over the scope.
+            expected = sorted(
+                {
+                    point_winners[offset]
+                    for offset, host in enumerate(hosts)
+                    if host in network and point_winners[offset] is not None
+                },
+                key=lambda ref: (0 if ref[0] == "allow" else 1, ref[1]),
+            )
+            actual = [(ref["side"], ref["index"])
+                      for ref in item["shadowed_by"]]
+            assert actual == expected
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_audit_matches_pointwise_evaluation_ipv4(seed):
+    rng = random.Random(6000 + seed)
+    prefixlen = rng.randint(26, 29)  # <= /29 keeps enumeration cheap
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 6)):
+            length = rng.randint(prefixlen - 3, 32)
+            base = rng.randrange(2 ** 32)
+            addr = (base >> (32 - length)) << (32 - length)
+            items.append(str(ipaddress.IPv4Network((addr, length))))
+        # Duplicates exercise the stable per-side priority.
+        if items and rng.random() < 0.3:
+            items.append(rng.choice(items))
+        return items
+
+    scope_addr = (rng.randrange(2 ** 32) >> (32 - prefixlen)) << (32 - prefixlen)
+    scope = str(ipaddress.IPv4Network((scope_addr, prefixlen)))
+    _assert_audit_matches_pointwise(scope, random_list(), random_list())
+
+
+@pytest.mark.parametrize("seed", range(24))
+def test_audit_matches_pointwise_evaluation_ipv6(seed):
+    rng = random.Random(7000 + seed)
+    prefixlen = rng.randint(122, 126)
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 5)):
+            length = rng.randint(prefixlen - 3, 128)
+            host = rng.randrange(2 ** (128 - prefixlen))
+            root = base + (host & ~((1 << (128 - prefixlen)) - 1))
+            addr = (root >> (128 - length)) << (128 - length)
+            items.append(str(ipaddress.IPv6Network((addr, length))))
+        if items and rng.random() < 0.3:
+            items.append(rng.choice(items))
+        return items
+
+    host = rng.randrange(2 ** (128 - prefixlen))
+    scope_addr = (base + host) & ~((1 << (128 - prefixlen)) - 1)
+    scope = str(ipaddress.IPv6Network((scope_addr, prefixlen)))
+    _assert_audit_matches_pointwise(scope, random_list(), random_list())

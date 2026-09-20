@@ -614,3 +614,253 @@ def test_allocate_is_documented_in_openapi():
     assert set(schema["properties"]) == {
         "allocations", "remaining", "remaining_addresses",
     }
+
+
+# --------------------------------------------------------------------------
+# POST /audit-rules
+# --------------------------------------------------------------------------
+
+
+def test_audit_rules_mixed_verdicts_and_order():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/24", "10.0.0.0/25"],
+            "deny": ["10.0.0.0/26"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["results"] == [
+        {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+         "status": "effective", "witness": "10.0.0.128"},
+        {"side": "allow", "index": 1, "cidr": "10.0.0.0/25",
+         "status": "effective", "witness": "10.0.0.64"},
+        {"side": "deny", "index": 0, "cidr": "10.0.0.0/26",
+         "status": "effective", "witness": "10.0.0.0"},
+    ]
+
+
+def test_audit_rules_shadowed_with_blockers():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": [
+                "10.0.0.0/24",
+                "10.0.0.0/25",
+                "10.0.0.128/25",
+            ],
+            "deny": ["10.0.0.0/26"],
+        },
+    )
+    assert response.status_code == 200
+    broad = response.json()["results"][0]
+    assert broad == {
+        "side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+        "status": "shadowed",
+        "shadowed_by": [
+            {"side": "allow", "index": 1},
+            {"side": "allow", "index": 2},
+            {"side": "deny", "index": 0},
+        ],
+    }
+
+
+def test_audit_rules_equal_length_deny_wins_tie():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/25"],
+            "deny": ["10.0.0.0/25"],
+        },
+    )
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert results[0] == {
+        "side": "allow", "index": 0, "cidr": "10.0.0.0/25",
+        "status": "shadowed",
+        "shadowed_by": [{"side": "deny", "index": 0}],
+    }
+    assert results[1] == {
+        "side": "deny", "index": 0, "cidr": "10.0.0.0/25",
+        "status": "effective", "witness": "10.0.0.0",
+    }
+
+
+def test_audit_rules_duplicate_stable_priority():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/24", "10.0.0.0/24"],
+            "deny": [],
+        },
+    )
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert results[0] == {
+        "side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+        "status": "effective", "witness": "10.0.0.0",
+    }
+    assert results[1] == {
+        "side": "allow", "index": 1, "cidr": "10.0.0.0/24",
+        "status": "shadowed",
+        "shadowed_by": [{"side": "allow", "index": 0}],
+    }
+
+
+def test_audit_rules_out_of_scope_same_family():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/24", "192.168.0.0/24"],
+            "deny": ["10.1.0.0/16"],
+        },
+    )
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert results[0]["status"] == "effective"
+    assert results[1] == {
+        "side": "allow", "index": 1, "cidr": "192.168.0.0/24",
+        "status": "out_of_scope",
+    }
+    assert results[2] == {
+        "side": "deny", "index": 0, "cidr": "10.1.0.0/16",
+        "status": "out_of_scope",
+    }
+
+
+def test_audit_rules_supernet_and_partial_overlap():
+    # Scope sits inside the broad deny, but a longer allow /24 covers it
+    # fully: the allow is effective and the deny is shadowed within scope.
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/25",
+            "allow": ["10.0.0.0/24"],
+            "deny": ["10.0.0.0/16"],
+        },
+    )
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert results[0] == {
+        "side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+        "status": "effective", "witness": "10.0.0.0",
+    }
+    assert results[1] == {
+        "side": "deny", "index": 0, "cidr": "10.0.0.0/16",
+        "status": "shadowed",
+        "shadowed_by": [{"side": "allow", "index": 0}],
+    }
+
+
+def test_audit_rules_ipv6():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "2001:db8::/126",
+            "allow": ["2001:db8::2/127"],
+            "deny": ["2001:db8::/127", "2001:db9::/32"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["results"] == [
+        {"side": "allow", "index": 0, "cidr": "2001:db8::2/127",
+         "status": "effective", "witness": "2001:db8::2"},
+        {"side": "deny", "index": 0, "cidr": "2001:db8::/127",
+         "status": "effective", "witness": "2001:db8::"},
+        {"side": "deny", "index": 1, "cidr": "2001:db9::/32",
+         "status": "out_of_scope"},
+    ]
+
+
+def test_audit_rules_empty_lists():
+    response = client.post("/audit-rules", json={"scope": "10.0.0.0/24"})
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+
+
+def test_audit_rules_wrong_family_returns_422():
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "allow": ["2001:db8::/32"]},
+    )
+    assert response.status_code == 422
+
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "2001:db8::/32", "deny": ["10.0.0.0/8"]},
+    )
+    assert response.status_code == 422
+
+
+def test_audit_rules_invalid_scope_returns_422():
+    response = client.post(
+        "/audit-rules", json={"scope": "bogus", "allow": [], "deny": []}
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+    response = client.post(
+        "/audit-rules", json={"scope": "10.0.0.1/24"}
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_audit_rules_missing_scope_returns_422():
+    response = client.post("/audit-rules", json={"allow": [], "deny": []})
+    assert response.status_code == 422
+    assert any("scope" in err["loc"] for err in response.json()["detail"])
+
+
+def test_audit_rules_invalid_rule_cidr_returns_422():
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "allow": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "allow" for err in response.json()["detail"])
+
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "deny": ["not-a-cidr"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "deny" for err in response.json()["detail"])
+
+
+def test_audit_rules_wrong_type_returns_422():
+    response = client.post("/audit-rules", json={"scope": 10})
+    assert response.status_code == 422
+
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "allow": [42]},
+    )
+    assert response.status_code == 422
+
+
+def test_audit_rules_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/audit-rules" in spec["paths"]
+    operation = spec["paths"]["/audit-rules"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "effective_shadowed_out_of_scope_and_duplicate" in examples
+    assert "family_mismatch" in examples
+    schema = spec["components"]["schemas"]["AuditRuleResult"]
+    assert schema["properties"]["status"]["enum"] == [
+        "effective", "shadowed", "out_of_scope",
+    ]
+    assert set(schema["properties"]) == {
+        "side", "index", "cidr", "status", "witness", "shadowed_by",
+    }
+    assert spec["components"]["schemas"]["RuleReference"]["properties"][
+        "side"
+    ]["enum"] == ["allow", "deny"]

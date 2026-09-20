@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.policy import _MAX_PREFIXLEN, parse_address, parse_network
 
@@ -255,5 +260,107 @@ class AllocateResponse(BaseModel):
         description=(
             "Total free addresses left in the scope, as a decimal string "
             "(IPv6 remainders exceed JSON's safe integer range)."
+        ),
+    )
+
+
+class AuditRulesRequest(BaseModel):
+    scope: str = Field(
+        description=(
+            "Single CIDR (IPv4 or IPv6) limiting the audit region. "
+            "Strict: host bits must be zero."
+        ),
+    )
+    allow: list[str] = Field(
+        default_factory=list,
+        description="Allowed CIDR list; every entry must match the scope family.",
+    )
+    deny: list[str] = Field(
+        default_factory=list,
+        description="Denied CIDR list; every entry must match the scope family.",
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        parse_network(value)
+        return value
+
+    @field_validator("allow", "deny")
+    @classmethod
+    def _validate_cidr_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_network(value)
+        return values
+
+    @model_validator(mode="after")
+    def _validate_family_against_scope(self) -> "AuditRulesRequest":
+        # Every audited rule must share the scope's address family; a
+        # mismatch can never affect the scope and is reported as 422 rather
+        # than silently skipped (unlike /normalize and /evaluate, which
+        # process both families at once).
+        scope = parse_network(self.scope)
+        for side, values in (("allow", self.allow), ("deny", self.deny)):
+            for value in values:
+                network = parse_network(value)
+                if not isinstance(network, type(scope)):
+                    raise ValueError(
+                        f"{side} CIDR {network} does not match the scope "
+                        f"address family ({scope})"
+                    )
+        return self
+
+
+class RuleReference(BaseModel):
+    side: Literal["allow", "deny"] = Field(
+        description="List the shadowing rule came from.",
+    )
+    index: int = Field(
+        description=(
+            "Per-side zero-based position of the shadowing rule in the "
+            "request, as used by the response ordering."
+        ),
+    )
+
+
+class AuditRuleResult(BaseModel):
+    side: Literal["allow", "deny"] = Field(
+        description="Input list the audited rule came from.",
+    )
+    index: int = Field(
+        description="Per-side zero-based position of the rule in the request.",
+    )
+    cidr: str = Field(
+        description="Canonical CIDR of the audited rule.",
+    )
+    status: Literal["effective", "shadowed", "out_of_scope"] = Field(
+        description=(
+            "effective: the rule decides at least one address in the scope; "
+            "shadowed: it overlaps the scope but never wins; out_of_scope: "
+            "it shares no address with the scope."
+        ),
+    )
+    witness: str | None = Field(
+        default=None,
+        description=(
+            "Smallest network address (by numeric order) inside the scope "
+            "where an effective rule wins; present only for effective rules."
+        ),
+    )
+    shadowed_by: list[RuleReference] = Field(
+        default_factory=list,
+        description=(
+            "Rules that actually win some part of this shadowed rule's "
+            "prefix inside the scope (allow-side first, then ascending "
+            "index); present only for shadowed rules and never empty then."
+        ),
+    )
+
+
+class AuditRulesResponse(BaseModel):
+    results: list[AuditRuleResult] = Field(
+        description=(
+            "One verdict per input rule, side-first (all allow entries in "
+            "input order, then all deny entries)."
         ),
     )

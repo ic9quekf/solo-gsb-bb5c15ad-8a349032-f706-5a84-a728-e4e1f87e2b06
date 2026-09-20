@@ -4,8 +4,8 @@
 
 接收 `allow` 与 `deny` 两个 CIDR 列表，分别对 **IPv4 / IPv6** 计算集合差
 **allow − deny**，返回与原策略**等价、互不重叠且数量最少**的 CIDR 集合。
-另提供地址判定（`/evaluate`）、策略对比（`/compare`）与子网分配
-（`/allocate`）接口。
+另提供地址判定（`/evaluate`）、策略对比（`/compare`）、子网分配
+（`/allocate`）与规则有效性审计（`/audit-rules`）接口。
 
 - deny 前缀切穿 allow 网段时，按二叉前缀树**递归对半拆分**直到边界对齐；
 - 仅当两个网段构成**完整相邻的兄弟前缀**（同一父网的左右两半）时才合并，
@@ -315,6 +315,95 @@ curl -i -X POST http://localhost:8000/allocate \
 重复 id、越界前缀长度、非法网段（格式错误、主机位非零、与 scope 不同族、
 超出 scope、占用列表互相重叠）统一返回 **HTTP 422**。
 
+### `POST /audit-rules`
+
+在**单个 `scope` CIDR** 内，对一组 allow/deny 规则**逐条审计**：该规则是否
+真的会影响 scope 内的最终判定。判定规则与 `/evaluate` 完全一致——**最长前缀
+获胜、同长度 deny 优先、同列表重复项按原序靠前优先**。审计只基于 CIDR
+递归分区（同 `/compare`），**不枚举地址**，IPv4/IPv6 均适用。
+
+请求体：
+
+| 字段     | 类型       | 说明                                   |
+| -------- | ---------- | -------------------------------------- |
+| `scope`  | `string`   | **必填**，单个 CIDR（IPv4 或 IPv6），审计区域；主机位非零返回 422 |
+| `allow`  | `string[]` | 允许列表，可省略（默认 `[]`）；每条必须与 scope **同地址族**，否则 422 |
+| `deny`   | `string[]` | 拒绝列表，规则同 `allow`               |
+
+每条规则返回一个判定结果，顺序为**输入侧 + 原序**：先全部 allow（按请求中的
+下标 0、1、2…），再全部 deny。每条结果固定包含 `side`、`index`、`cidr`、
+`status` 四个字段；规则状态分三类：
+
+- **`effective`（有效）**：该规则在 scope 内至少是一个地址的获胜条目，额外给出
+  `witness`——其获胜区域中**数值最小的网络地址**（始终是某个分区网段的网络地址，
+  无需枚举地址即可得到），可直接拿这个地址去 `/evaluate` 复核；
+- **`shadowed`（被遮蔽）**：规则与 scope 有交集，但在交集内**从未获胜**；
+  额外给出 `shadowed_by`：使其始终无法获胜的规则索引集合，即实际在该规则前缀
+  内部、scope 之内各区域上获胜的所有规则（用 `{side, index}` 标识，allow 在前、
+  按下标升序）。即使删除其中某一条，规则仍被集合中其余规则遮蔽；
+- **`out_of_scope`（超出范围）**：规则与 scope 同地址族但**没有任何地址交集**
+  （注意：地址族不一致不属于此类，直接返回 422），不带 `witness` /
+  `shadowed_by` 字段。
+
+`witness` 只在 `effective` 时出现，`shadowed_by` 只在 `shadowed` 时出现。
+
+重复规则按稳定优先级处理：完全相同的两条规则，靠前者在其前缀上获胜（
+`effective`），靠后者被靠前者遮蔽（`shadowed_by` 指向靠前那条）。
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:8000/audit-rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "scope": "10.0.0.0/24",
+        "allow": ["10.0.0.0/24", "10.0.0.0/24", "10.0.0.64/28"],
+        "deny":  ["10.0.0.0/26", "10.0.1.0/24"]
+      }'
+```
+
+响应（allow 按原序在前、deny 在后）：
+
+```json
+{
+  "results": [
+    {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+     "status": "effective", "witness": "10.0.0.80"},
+    {"side": "allow", "index": 1, "cidr": "10.0.0.0/24",
+     "status": "shadowed",
+     "shadowed_by": [
+       {"side": "allow", "index": 0},
+       {"side": "allow", "index": 2},
+       {"side": "deny", "index": 0}
+     ]},
+    {"side": "allow", "index": 2, "cidr": "10.0.0.64/28",
+     "status": "effective", "witness": "10.0.0.64"},
+    {"side": "deny", "index": 0, "cidr": "10.0.0.0/26",
+     "status": "effective", "witness": "10.0.0.0"},
+    {"side": "deny", "index": 1, "cidr": "10.0.1.0/24",
+     "status": "out_of_scope"}
+  ]
+}
+```
+
+解读：
+
+- `allow[0]` 的 `/24` 虽然被 deny `/26`（`10.0.0.0–63`）和 `allow[2]` 的
+  `/28`（`10.0.0.64–79`）覆盖了一部分，仍在 `10.0.0.80–255` 上获胜，故
+  `effective`，witness 取获胜区域最小地址 `10.0.0.80`；
+- `allow[1]` 是与 `allow[0]` 完全重复的条目：按稳定优先级它永远排在后面，
+  `shadowed_by` 列出其前缀内部实际获胜的三条规则；
+- `deny[1]`（`10.0.1.0/24`）与 scope 无交集 → `out_of_scope`。
+
+其他要点：
+
+- 规则 CIDR **可以大于、等于或部分相交于 scope**：大于 scope 的规则只要在
+  scope 内没有更长前缀反制，同样是 `effective`，其 witness 落在 scope 内部；
+  若在 scope 内处处被更长前缀压制，则为 `shadowed`；
+- 裸地址按主机前缀处理（`10.0.0.1` ≡ `10.0.0.1/32`，`::1` ≡ `::1/128`）；
+- `scope` 缺失/非法/主机位非零、规则 CIDR 非法，或任一规则与 scope
+  **地址族不一致**，统一返回 **HTTP 422**。
+
 ## 算法说明
 
 1. **解析校验**：`ipaddress.ip_network(value, strict=True)` 严格解析；
@@ -353,6 +442,21 @@ curl -i -X POST http://localhost:8000/allocate \
    不可行立即剪枝；失败的 `(深度, 空闲集合)` 状态记入备忘录避免重复
    搜索。
 
+`/audit-rules` 与 `/compare` 同源，复用同一套 scope 分区原语
+（`app/policy.py` 中 `_winner_partition` / `_winner_partition_node`）：
+
+1. 自 scope 起按前缀树递归：scope 上的获胜条目（最长前缀、同长度 deny
+   优先、同侧重复合靠前索引优先）作为继承获胜者，严格子网把当前节点
+   对半切开，直到每个叶子瓦片上的获胜条目恒定；全程只在 CIDR 上运算，
+   **不枚举任何地址**；
+2. 每个瓦片保留**获胜条目的身份**（侧 + 该侧原序索引），而不只是 allow/
+   deny 判定，从而能区分重复规则究竟是哪一条生效；
+3. 对每条规则：与 scope 无交集即 `out_of_scope`；否则取其前缀内部
+   （分区对齐保证瓦片要么整体落入规则前缀、要么完全不相交）获胜身份恰为
+   该规则的瓦片——存在则为 `effective`，witness 取这些瓦片中网络地址
+   最小者的网络地址；不存在则为 `shadowed`，`shadowed_by` 汇总该前缀内
+   各瓦片的实际获胜条目身份。
+
 ## 本地开发（不使用 Docker）
 
 需要 Python 3.11+：
@@ -377,11 +481,11 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/allocate
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、分区对比、子网分配搜索（仅 ipaddress）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/allocate、/audit-rules
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、分区对比、子网分配搜索、规则有效性审计（仅 ipaddress）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare 逐地址对拍、/allocate 暴力枚举对拍）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare 逐地址对拍、/allocate 暴力枚举对拍、/audit-rules 逐地址对拍）
 │   └── test_api.py    # API 层测试（422、409、统计、空请求等）
 ├── Dockerfile
 ├── docker-compose.yml
