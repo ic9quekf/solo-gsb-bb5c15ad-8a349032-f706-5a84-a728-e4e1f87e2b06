@@ -312,15 +312,17 @@ def _partition_node(
     network: Network,
     inherited: tuple[int, Network, str] | None,
     entries: Sequence[tuple[int, Network, str]],
-    out: list[tuple[Network, str]],
+    out: list[tuple[Network, tuple[int, Network, str] | None]],
 ) -> None:
-    """Recursively append decision-constant pieces covering ``network``.
+    """Recursively append winner-constant pieces covering ``network``.
 
-    ``inherited`` is the winning entry of a strictly broader prefix (already
-    decided at an ancestor); ``entries`` are all entries that are subnets of
-    ``network`` (equal or stricter).  A node only needs splitting while it
-    contains an entry strictly deeper than itself, mirroring :func:`_diff`:
-    untouched halves survive whole, which keeps every piece maximal.
+    Each emitted piece is paired with the exact entry that wins everywhere in
+    it (``None`` when the piece is unmatched).  ``inherited`` is the winning
+    entry of a strictly broader prefix (already decided at an ancestor);
+    ``entries`` are all entries that are subnets of ``network`` (equal or
+    stricter).  A node only needs splitting while it contains an entry
+    strictly deeper than itself, mirroring :func:`_diff`: untouched halves
+    survive whole, which keeps every piece maximal.
     """
     own = [entry for entry in entries if entry[1] == network]
     strict = [entry for entry in entries if entry[1] != network]
@@ -331,7 +333,7 @@ def _partition_node(
         winner = inherited
 
     if not strict or network.prefixlen == _MAX_PREFIXLEN[type(network)]:
-        out.append((network, _winner_side(winner)))
+        out.append((network, winner))
         return
 
     left, right = network.subnets()
@@ -340,15 +342,16 @@ def _partition_node(
         _partition_node(half, winner, half_entries, out)
 
 
-def _decision_partition(
+def _winner_partition(
     scope: Network,
     entries: Sequence[tuple[int, Network, str]],
-) -> list[tuple[Network, str]]:
-    """Partition ``scope`` into maximal CIDRs each having one constant decision.
+) -> list[tuple[Network, tuple[int, Network, str] | None]]:
+    """Partition ``scope`` into maximal CIDRs, each paired with its winner.
 
-    Entries equal to or broader than ``scope`` decide the root (longest prefix,
-    deny winning equal-length ties); strict subnets force recursive splits.
-    The returned pieces are non-overlapping and jointly exhaust ``scope``.
+    Entries equal to or broader than ``scope`` decide the root (longest
+    prefix, deny winning equal-length ties); strict subnets force recursive
+    splits.  The returned pieces are non-overlapping and jointly exhaust
+    ``scope``; a paired winner of ``None`` means the piece is unmatched.
     """
     covering = [
         entry for entry in entries
@@ -360,9 +363,9 @@ def _decision_partition(
         if entry[1] != scope and entry[1].subnet_of(scope)
     ]
 
-    pieces: list[tuple[Network, str]] = []
+    pieces: list[tuple[Network, tuple[int, Network, str] | None]] = []
     if not strict:
-        pieces.append((scope, _winner_side(root_winner)))
+        pieces.append((scope, root_winner))
         return pieces
 
     left, right = scope.subnets()
@@ -370,6 +373,21 @@ def _decision_partition(
         half_entries = [entry for entry in strict if entry[1].subnet_of(half)]
         _partition_node(half, root_winner, half_entries, pieces)
     return pieces
+
+
+def _decision_partition(
+    scope: Network,
+    entries: Sequence[tuple[int, Network, str]],
+) -> list[tuple[Network, str]]:
+    """Partition ``scope`` into maximal CIDRs each having one constant decision.
+
+    Thin decision-side projection of :func:`_winner_partition` (the
+    ``/compare`` path only needs the winning side, not the entry itself).
+    """
+    return [
+        (network, _winner_side(winner))
+        for network, winner in _winner_partition(scope, entries)
+    ]
 
 
 def _overlay_partitions(
@@ -482,6 +500,125 @@ def compare(
             key: str(counts[key]) for key in TRANSITION_KEYS
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# audit-rules: per-entry impact classification inside one scope.  Every allow/
+# deny entry is effective (wins somewhere in scope, with the numerically
+# smallest witness IP), shadowed (covered inside scope by entries that always
+# beat it; shadowed_by lists their side+index) or out_of_scope (no overlap).
+# Analysis reuses the CIDR winner partition above and never enumerates
+# addresses.
+# ---------------------------------------------------------------------------
+
+
+def audit_rules(
+    scope_raw: str,
+    allow_raw: Sequence[str],
+    deny_raw: Sequence[str],
+) -> dict:
+    """Classify every input rule by its real impact on decisions in ``scope``.
+
+    The scope is partitioned into winner-constant maximal CIDRs by
+    :func:`_winner_partition`.  A rule's region is its CIDR clipped to the
+    scope; it is ``effective`` when it wins one or more partition pieces
+    (the witness is the smallest network address among those pieces),
+    ``shadowed`` when the region is non-empty but another entry wins every
+    piece of it, or ``out_of_scope`` when its CIDR does not intersect the
+    scope at all.  ``shadowed_by`` holds the distinct ``(side, index)``
+    references of the entries actually winning those pieces — only entries
+    that can win themselves can shadow.
+
+    Inputs are assumed validated already (e.g. by the Pydantic schema): the
+    scope and every rule CIDR parse strictly and all share one address
+    family.  A malformed value raises :class:`ValueError`.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+
+    allow_nets = [parse_network(item) for item in allow_raw]
+    deny_nets = [parse_network(item) for item in deny_raw]
+    entries: list[tuple[int, Network, str]] = [
+        (index, network, "allow")
+        for index, network in enumerate(allow_nets)
+        if isinstance(network, family)
+    ]
+    entries.extend(
+        (index, network, "deny")
+        for index, network in enumerate(deny_nets)
+        if isinstance(network, family)
+    )
+
+    partition = _winner_partition(scope, entries)
+
+    def classify(
+        side: str, index: int, network: Network
+    ) -> dict:
+        if not network.overlaps(scope):
+            # CIDRs are laminar: a same-family network is either disjoint or
+            # nested, so a disjoint entry never affects scope at all.
+            return {"status": "out_of_scope"}
+
+        # Pieces tile the whole scope; because CIDRs never partially overlap,
+        # a piece intersects the entry exactly when one equals or contains
+        # the other (the entry may be broader than the whole scope).
+        own_pieces = [
+            (piece, winner)
+            for piece, winner in partition
+            if piece == network or piece.subnet_of(network)
+            or network.subnet_of(piece)
+        ]
+
+        won = [
+            piece
+            for piece, winner in own_pieces
+            if winner is not None
+            and winner[1] == network and winner[2] == side
+            and winner[0] == index
+        ]
+        if won:
+            # Smallest network address of the pieces the rule wins is the
+            # numerically smallest address in its winning region and is
+            # always inside that region.
+            witness = min(won, key=_sort_key).network_address
+            return {"status": "effective", "witness": str(witness)}
+
+        # The rule never wins inside scope: collect the distinct entries that
+        # win pieces of its region (unmatched pieces contribute no shadower).
+        shadowed_by = sorted(
+            {
+                (winner[2], winner[0])
+                for _, winner in own_pieces
+                if winner is not None
+            },
+        )
+        return {
+            "status": "shadowed",
+            "shadowed_by": [
+                {"side": rule_side, "index": rule_index}
+                for rule_side, rule_index in shadowed_by
+            ],
+        }
+
+    allow_results: list[dict] = []
+    for index, network in enumerate(allow_nets):
+        allow_results.append({
+            "side": "allow",
+            "index": index,
+            "cidr": str(network),
+            **classify("allow", index, network),
+        })
+
+    deny_results: list[dict] = []
+    for index, network in enumerate(deny_nets):
+        deny_results.append({
+            "side": "deny",
+            "index": index,
+            "cidr": str(network),
+            **classify("deny", index, network),
+        })
+
+    return {"allow": allow_results, "deny": deny_results}
 
 
 # ---------------------------------------------------------------------------

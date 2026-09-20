@@ -384,6 +384,218 @@ def test_compare_is_documented_in_openapi():
 
 
 # --------------------------------------------------------------------------
+# POST /audit-rules
+# --------------------------------------------------------------------------
+
+
+def test_audit_rules_basic_effective_shadowed_and_out_of_scope():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": [
+                "10.0.0.0/24",     # wins the upper half
+                "10.0.0.0/25",     # deny beats it at equal length
+                "10.0.0.0/25",     # duplicate, also loses
+            ],
+            "deny": [
+                "10.0.0.0/25",     # wins the lower half
+                "10.1.0.0/16",     # disjoint from scope
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "allow": [
+            {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+             "status": "effective", "witness": "10.0.0.128",
+             "shadowed_by": None},
+            {"side": "allow", "index": 1, "cidr": "10.0.0.0/25",
+             "status": "shadowed", "witness": None,
+             "shadowed_by": [{"side": "deny", "index": 0}]},
+            {"side": "allow", "index": 2, "cidr": "10.0.0.0/25",
+             "status": "shadowed", "witness": None,
+             "shadowed_by": [{"side": "deny", "index": 0}]},
+        ],
+        "deny": [
+            {"side": "deny", "index": 0, "cidr": "10.0.0.0/25",
+             "status": "effective", "witness": "10.0.0.0",
+             "shadowed_by": None},
+            {"side": "deny", "index": 1, "cidr": "10.1.0.0/16",
+             "status": "out_of_scope", "witness": None,
+             "shadowed_by": None},
+        ],
+    }
+
+
+def test_audit_rules_response_follows_input_order():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            # Deliberately unordered by address.
+            "allow": ["10.0.0.128/25", "10.0.0.0/25", "10.0.0.0/24"],
+            "deny": ["10.0.0.192/26", "10.0.0.0/25"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert [item["cidr"] for item in data["allow"]] == [
+        "10.0.0.128/25", "10.0.0.0/25", "10.0.0.0/24",
+    ]
+    assert [item["index"] for item in data["allow"]] == [0, 1, 2]
+    assert [item["cidr"] for item in data["deny"]] == [
+        "10.0.0.192/26", "10.0.0.0/25",
+    ]
+    assert [item["index"] for item in data["deny"]] == [0, 1]
+
+
+def test_audit_rules_witness_is_numerically_smallest_winning_address():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/24"],
+            "deny": ["10.0.0.0/26", "10.0.0.64/26", "10.0.0.128/26"],
+        },
+    )
+    assert response.status_code == 200
+    allow = response.json()["allow"][0]
+    # Only the top /26 survives for the allow.
+    assert allow["status"] == "effective"
+    assert allow["witness"] == "10.0.0.192"
+
+
+def test_audit_rules_duplicate_denies_keep_earliest_priority():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": [],
+            "deny": ["10.0.0.0/24", "10.0.0.0/24"],
+        },
+    )
+    assert response.status_code == 200
+    deny = response.json()["deny"]
+    assert deny[0]["status"] == "effective"
+    assert deny[0]["witness"] == "10.0.0.0"
+    assert deny[1] == {
+        "side": "deny", "index": 1, "cidr": "10.0.0.0/24",
+        "status": "shadowed", "witness": None,
+        "shadowed_by": [{"side": "deny", "index": 0}],
+    }
+
+
+def test_audit_rules_ipv6():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "2001:db8::/126",
+            "allow": ["2001:db8::/126", "2001:db8::3/128"],
+            "deny": ["2001:db8::3/128"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["allow"][0] == {
+        "side": "allow", "index": 0, "cidr": "2001:db8::/126",
+        "status": "effective", "witness": "2001:db8::",
+        "shadowed_by": None}
+    assert data["allow"][1]["status"] == "shadowed"
+    assert data["allow"][1]["shadowed_by"] == [
+        {"side": "deny", "index": 0}]
+    assert data["deny"][0] == {
+        "side": "deny", "index": 0, "cidr": "2001:db8::3/128",
+        "status": "effective", "witness": "2001:db8::3",
+        "shadowed_by": None}
+
+
+def test_audit_rules_empty_rules():
+    response = client.post("/audit-rules", json={"scope": "10.0.0.0/24"})
+    assert response.status_code == 200
+    assert response.json() == {"allow": [], "deny": []}
+
+
+def test_audit_rules_invalid_scope_returns_422():
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "bogus", "allow": [], "deny": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_audit_rules_scope_host_bits_return_422():
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.1/24", "allow": [], "deny": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_audit_rules_missing_scope_returns_422():
+    response = client.post("/audit-rules", json={"allow": [], "deny": []})
+    assert response.status_code == 422
+    assert any("scope" in err["loc"] for err in response.json()["detail"])
+
+
+def test_audit_rules_invalid_rule_cidr_returns_422():
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "allow": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "allow" for err in response.json()["detail"])
+
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "deny": ["not-a-cidr"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "deny" for err in response.json()["detail"])
+
+
+def test_audit_rules_family_mismatch_returns_422():
+    # Unlike /compare, a rule of the other family is a hard 422 here.
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "allow": ["2001:db8::/32"]},
+    )
+    assert response.status_code == 422
+    msg = response.json()["detail"][0]["msg"]
+    assert "address family" in msg
+
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "2001:db8::/32", "deny": ["10.0.0.0/8"]},
+    )
+    assert response.status_code == 422
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+
+def test_audit_rules_wrong_type_returns_422():
+    response = client.post("/audit-rules", json={"scope": 10})
+    assert response.status_code == 422
+
+
+def test_audit_rules_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/audit-rules" in spec["paths"]
+    operation = spec["paths"]["/audit-rules"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "effective_shadowed_and_out_of_scope" in examples
+    schema = spec["components"]["schemas"]["RuleAuditResult"]
+    assert schema["properties"]["status"]["enum"] == [
+        "effective", "shadowed", "out_of_scope"]
+    ref_schema = spec["components"]["schemas"]["RuleReference"]
+    assert ref_schema["properties"]["side"]["enum"] == ["allow", "deny"]
+
+
+# --------------------------------------------------------------------------
 # POST /allocate
 # --------------------------------------------------------------------------
 

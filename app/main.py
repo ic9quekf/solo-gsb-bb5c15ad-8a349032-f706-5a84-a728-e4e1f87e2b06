@@ -1,14 +1,17 @@
-"""FastAPI application exposing POST /normalize, /evaluate, /compare and /allocate."""
+"""FastAPI application exposing POST /normalize, /evaluate, /compare,
+/audit-rules and /allocate."""
 
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 
-from app.policy import allocate, compare, evaluate, normalize
+from app.policy import allocate, audit_rules, compare, evaluate, normalize
 from app.schemas import (
     AddressDecision,
     AllocateRequest,
     AllocateResponse,
+    AuditRulesRequest,
+    AuditRulesResponse,
     CompareRequest,
     CompareResponse,
     EvaluateRequest,
@@ -23,10 +26,11 @@ app = FastAPI(
         "equivalent, non-overlapping, minimum-count CIDR set; evaluate "
         "individual addresses against the same lists via longest-prefix "
         "match; diff two policy sets (baseline vs candidate) over a "
-        "scope CIDR; and allocate non-overlapping subnets for a list of "
+        "scope CIDR; audit each allow/deny rule for its real impact inside "
+        "one scope; and allocate non-overlapping subnets for a list of "
         "requests inside one scope, avoiding already-occupied CIDRs."
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -206,6 +210,98 @@ def compare_policies(request: CompareRequest) -> dict:
         request.candidate.allow,
         request.candidate.deny,
     )
+
+
+@app.post(
+    "/audit-rules",
+    response_model=AuditRulesResponse,
+    tags=["policy"],
+    summary="Classify each allow/deny rule by its real impact inside a scope",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "effective_shadowed_and_out_of_scope": {
+                            "summary": (
+                                "A broad allow wins where no deny reaches; an "
+                                "equal-length allow is shadowed by the deny; "
+                                "a disjoint rule is out of scope; duplicate "
+                                "allows keep the earliest copy"
+                            ),
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "allow": [
+                                    "10.0.0.0/24",
+                                    "10.0.0.0/25",
+                                    "10.0.0.0/25",
+                                ],
+                                "deny": [
+                                    "10.0.0.0/25",
+                                    "10.1.0.0/16",
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "One audit result per input rule, grouped by input side and "
+                "kept in input order."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "effective_shadowed_and_out_of_scope": {
+                            "summary": "Witness IPs and shadower index sets",
+                            "value": {
+                                "allow": [
+                                    {"side": "allow", "index": 0,
+                                     "cidr": "10.0.0.0/24",
+                                     "status": "effective",
+                                     "witness": "10.0.0.128"},
+                                    {"side": "allow", "index": 1,
+                                     "cidr": "10.0.0.0/25",
+                                     "status": "shadowed",
+                                     "shadowed_by": [
+                                         {"side": "deny", "index": 0}]},
+                                    {"side": "allow", "index": 2,
+                                     "cidr": "10.0.0.0/25",
+                                     "status": "shadowed",
+                                     "shadowed_by": [
+                                         {"side": "deny", "index": 0}]},
+                                ],
+                                "deny": [
+                                    {"side": "deny", "index": 0,
+                                     "cidr": "10.0.0.0/25",
+                                     "status": "effective",
+                                     "witness": "10.0.0.0"},
+                                    {"side": "deny", "index": 1,
+                                     "cidr": "10.1.0.0/16",
+                                     "status": "out_of_scope"},
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "Invalid scope/rule CIDR, or a rule whose address family does "
+                "not match the scope."
+            ),
+        },
+    },
+)
+def audit_policy_rules(request: AuditRulesRequest) -> dict:
+    return audit_rules(request.scope, request.allow, request.deny)
 
 
 @app.post(

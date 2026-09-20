@@ -4,14 +4,17 @@
 
 接收 `allow` 与 `deny` 两个 CIDR 列表，分别对 **IPv4 / IPv6** 计算集合差
 **allow − deny**，返回与原策略**等价、互不重叠且数量最少**的 CIDR 集合。
-另提供地址判定（`/evaluate`）、策略对比（`/compare`）与子网分配
-（`/allocate`）接口。
+另提供地址判定（`/evaluate`）、策略对比（`/compare`）、规则影响审计
+（`/audit-rules`）与子网分配（`/allocate`）接口。
 
 - deny 前缀切穿 allow 网段时，按二叉前缀树**递归对半拆分**直到边界对齐；
 - 仅当两个网段构成**完整相邻的兄弟前缀**（同一父网的左右两半）时才合并，
   借助 `ipaddress.collapse_addresses` 实现，保证最小化且不会跨边界聚合；
 - 输出按 **地址族（IPv4 → IPv6）→ 网络地址 → 前缀长度** 稳定排序；
 - 统计 allow / deny 的输入数量、去重后数量（按族拆分）与最终输出数量；
+- `/audit-rules` 在单个 scope 内基于 **CIDR 分区**（不枚举地址）逐条判断
+  规则为 `effective` / `shadowed` / `out_of_scope`，给出最小 witness IP 与
+  使其无法获胜的规则索引集合，兼容 IPv4/IPv6；
 - `/allocate` 在单个 scope 内为多条申请分配互不重叠、避开占用网段的子网，
   按申请顺序取**网络地址序列字典序最小**的完整可行方案（必要时回溯）；
 - 非法 CIDR（格式错误、越界前缀、主机位非零）统一返回 **HTTP 422**。
@@ -233,6 +236,101 @@ curl -s -X POST http://localhost:8000/compare \
 - `scope` 缺失、非法、主机位非零，或嵌套的 baseline/candidate 中存在
   非法 CIDR，统一返回 **HTTP 422**。
 
+### `POST /audit-rules`
+
+在**单个 `scope` CIDR** 内，接收现有 allow/deny 两个列表，**按输入侧与原序**
+逐条审计每条规则是否真正影响最终判定。判定规则沿用 `/evaluate`：
+
+1. **前缀长度最长者胜**；
+2. 前缀长度相同 → **deny 胜过 allow**；
+3. 仍相同（同一列表内的重复项）→ 按该列表中的**原顺序**取第一条（重复规则
+   的稳定优先级）。
+
+分析完全基于 **CIDR 分区**（自 scope 起递归对半切分，只按网段集合运算），
+**不枚举任何地址**，因此兼容巨大 IPv6 网段（如 `::/0`），也兼容 IPv4。
+
+请求体：
+
+| 字段    | 类型       | 说明                                   |
+| ------- | ---------- | -------------------------------------- |
+| `scope` | `string`   | **必填**，单个 CIDR（IPv4 或 IPv6），限定审计区域；主机位非零返回 422 |
+| `allow` | `string[]` | 允许列表，可省略（默认 `[]`）；每条必须与 scope **同地址族** |
+| `deny`  | `string[]` | 拒绝列表，规则同 `allow`               |
+
+每条规则的审计结论（`status`）：
+
+- **`effective`**：规则在 scope 内**至少赢下一个区域**（对该区域内地址起决定
+  作用）。响应给出 `witness`：该规则获胜区域内**数值最小的网络地址**（裸 IP
+  字符串，IPv6 采用压缩写法）；它一定落在获胜区域内，且位于某个分区网段的
+  边界上，无需枚举地址即可算出。
+- **`shadowed`**：规则与 scope 相交，但在 scope 内**处处无法获胜**。响应给出
+  `shadowed_by`：**真正赢下其区域各部分的规则的 `(side, index)` 集合**（去重、
+  按 side、index 排序）；只有自己也能获胜的规则才会出现——本身也被遮蔽的死
+  规则不会被列入。`index` 为该规则在对应输入列表中的 **0 基下标**。
+- **`out_of_scope`**：规则 CIDR 与 scope **完全不相交**（同地址族但无交集），
+  对 scope 内判定没有任何影响。大于等于 scope 的规则按 scope 裁剪后的区域
+  分析；裸地址按 `/32`、`/128` 处理。
+
+> 注意：与 `/compare` 静默忽略异地址族条目的策略不同，`/audit-rules` 中任何
+> 规则与 scope **地址族不一致都直接返回 422**。
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:8000/audit-rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "scope": "10.0.0.0/24",
+        "allow": [
+          "10.0.0.0/24",
+          "10.0.0.0/25",
+          "10.0.0.0/25"
+        ],
+        "deny": [
+          "10.0.0.0/25",
+          "10.1.0.0/16"
+        ]
+      }'
+```
+
+响应（`allow` / `deny` 各自与输入**等长、同序**）：
+
+```json
+{
+  "allow": [
+    {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+     "status": "effective", "witness": "10.0.0.128", "shadowed_by": null},
+    {"side": "allow", "index": 1, "cidr": "10.0.0.0/25",
+     "status": "shadowed", "witness": null,
+     "shadowed_by": [{"side": "deny", "index": 0}]},
+    {"side": "allow", "index": 2, "cidr": "10.0.0.0/25",
+     "status": "shadowed", "witness": null,
+     "shadowed_by": [{"side": "deny", "index": 0}]}
+  ],
+  "deny": [
+    {"side": "deny", "index": 0, "cidr": "10.0.0.0/25",
+     "status": "effective", "witness": "10.0.0.0", "shadowed_by": null},
+    {"side": "deny", "index": 1, "cidr": "10.1.0.0/16",
+     "status": "out_of_scope", "witness": null, "shadowed_by": null}
+  ]
+}
+```
+
+字段说明：
+
+- `side` / `index` / `cidr`：规则来源侧（`allow` / `deny`）、在该侧输入列表中
+  的 0 基下标、规范 CIDR；
+- `status`：`effective` / `shadowed` / `out_of_scope`；
+- `witness`：仅 `effective` 时出现，为该规则获胜区域内数值最小的 IP（上例中
+  allow `/24` 只在高地址半区 `10.0.0.128/25` 获胜，故 witness 为
+  `10.0.0.128` 而非规则自身起点 `10.0.0.0`）；
+- `shadowed_by`：仅 `shadowed` 时出现，为赢下该规则区域各部分的规则引用集合；
+  上例中两条重复的 allow `/25`（index 1、2）都在同长度对决中败给
+  deny index 0，故二者 `shadowed_by` 相同。
+
+`scope` 缺失/非法/主机位非零、规则 CIDR 非法，或规则与 scope 地址族不一致，
+统一返回 **HTTP 422**。
+
 ### `POST /allocate`
 
 在**单个 `scope` CIDR** 内，为多条子网申请分配**互不重叠、且不触碰占用
@@ -330,7 +428,7 @@ curl -i -X POST http://localhost:8000/allocate \
 5. **稳定排序**：按地址族、`network_address.packed`、前缀长度排序。
 
 `/compare` 在同一套判定规则之上另走一条路径（`app/policy.py` 中
-`_decision_partition` / `_overlay_partitions` / `_merge_labelled`）：
+`_winner_partition` / `_overlay_partitions` / `_merge_labelled`）：
 
 1. 对每组策略，自 scope 起按前缀树递归：scope 上的获胜条目（最长前缀、
    同长度 deny 优先）作为继承判定，严格子网把当前节点对半切开，判定
@@ -339,6 +437,20 @@ curl -i -X POST http://localhost:8000/allocate \
    `baseline_decision != candidate_decision` 的瓦片；
 3. 按转换标签做**带标签的完整兄弟合并**（不动点循环）：同一父网的左右
    两半都在、且转换类型完全相同时才合并，合并后的父网段继续向上合并。
+
+`/audit-rules` 复用同一套**获胜者分区**（`app/policy.py` 中
+`audit_rules` / `_winner_partition`）：分区把 scope 切成互不重叠、联合穷尽
+scope 的最大 CIDR 瓦片，每块直接携带**获胜条目本体**（无获胜者则为
+`unmatched`）。对每条规则：
+
+1. CIDR 与 scope 不相交 → `out_of_scope`（对齐前缀只可能包含或不相交，
+   不存在“切穿”）；
+2. 否则取与该规则相交的瓦片集合（同样只有相等或包含关系）：
+   - 其中存在获胜条目就是本规则的瓦片 → `effective`，witness 取这些瓦片中
+     网络地址最小者（瓦片边界地址必在获胜区域内），全程只有网段运算，
+     **不枚举地址**；
+   - 否则 → `shadowed`，把各瓦片实际获胜条目的 `(side, index)` 去重收集为
+     `shadowed_by`；无任何条目获胜的瓦片（`unmatched`）不贡献遮蔽者。
 
 `/allocate` 的搜索同样建立在 `scope − occupied` 的最小空闲集合之上
 （`app/policy.py` 中 `_search` / `_fits` / `_subtract_free`）：
@@ -377,11 +489,11 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/allocate
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、分区对比、子网分配搜索（仅 ipaddress）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/allocate
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、子网分配搜索（仅 ipaddress）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare 逐地址对拍、/allocate 暴力枚举对拍）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/allocate 暴力枚举对拍）
 │   └── test_api.py    # API 层测试（422、409、统计、空请求等）
 ├── Dockerfile
 ├── docker-compose.yml

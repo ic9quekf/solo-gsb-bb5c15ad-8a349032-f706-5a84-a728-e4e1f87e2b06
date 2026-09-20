@@ -141,6 +141,100 @@ class CompareResponse(BaseModel):
     )
 
 
+class AuditRulesRequest(BaseModel):
+    scope: str = Field(
+        description=(
+            "Single CIDR (IPv4 or IPv6) limiting the audit region. "
+            "Strict: host bits must be zero."
+        ),
+    )
+    allow: list[str] = Field(
+        default_factory=list,
+        description="Allowed CIDR list; every entry must match the scope family.",
+    )
+    deny: list[str] = Field(
+        default_factory=list,
+        description="Denied CIDR list; every entry must match the scope family.",
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        parse_network(value)
+        return value
+
+    @field_validator("allow", "deny")
+    @classmethod
+    def _validate_cidr_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_network(value)
+        return values
+
+    @model_validator(mode="after")
+    def _validate_family_against_scope(self) -> "AuditRulesRequest":
+        # A wrong-family rule is a 422 here (unlike /compare, which ignores
+        # it): the audit is explicitly scoped to one address family.
+        scope = parse_network(self.scope)
+        for side, entries in (("allow", self.allow), ("deny", self.deny)):
+            for value in entries:
+                network = parse_network(value)
+                if not isinstance(network, type(scope)):
+                    raise ValueError(
+                        f"{side} CIDR {network} does not match the scope "
+                        f"address family ({scope})"
+                    )
+        return self
+
+
+class RuleReference(BaseModel):
+    side: Literal["allow", "deny"] = Field(
+        description="Input list the shadowing rule came from.",
+    )
+    index: int = Field(
+        description="Position of the shadowing rule in that list (0-based).",
+    )
+
+
+class RuleAuditResult(BaseModel):
+    side: Literal["allow", "deny"] = Field(
+        description="Input list this rule came from.",
+    )
+    index: int = Field(
+        description="Position of this rule in its input list (0-based).",
+    )
+    cidr: str = Field(description="Canonical CIDR of the input rule.")
+    status: Literal["effective", "shadowed", "out_of_scope"] = Field(
+        description=(
+            "'effective' when the rule decides somewhere inside scope; "
+            "'shadowed' when other rules beat it everywhere inside scope; "
+            "'out_of_scope' when the rule CIDR does not intersect scope."
+        ),
+    )
+    witness: str | None = Field(
+        default=None,
+        description=(
+            "Numerically smallest network address in the region where the "
+            "rule wins; present only when status is 'effective'."
+        ),
+    )
+    shadowed_by: list[RuleReference] | None = Field(
+        default=None,
+        description=(
+            "Distinct input rules that win every part of this rule's region "
+            "inside scope; present only when status is 'shadowed'."
+        ),
+    )
+
+
+class AuditRulesResponse(BaseModel):
+    allow: list[RuleAuditResult] = Field(
+        description="One result per allow entry, in input order.",
+    )
+    deny: list[RuleAuditResult] = Field(
+        description="One result per deny entry, in input order.",
+    )
+
+
 class AllocationRequest(BaseModel):
     id: str = Field(
         min_length=1,
